@@ -1,126 +1,133 @@
 #!/usr/bin/env python3
 
-import os
 import rospy
-import cv2
+from os import uname
+from re import match
 import numpy as np
-from cv_bridge import CvBridge
-from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from duckietown.dtros import DTROS, NodeType
+from sensor_msgs.msg import CompressedImage, CameraInfo
+import cv2
+from cv_bridge import CvBridge
+
 
 class CameraDistortionNode(DTROS):
     def __init__(self, node_name):
-        # Initialize the DTROS parent class
+        # Initialize DTROS parent class
         super(CameraDistortionNode, self).__init__(
-            node_name=node_name,
-            node_type=NodeType.PERCEPTION
-        )
-       
-        # Get vehicle name from environment variable
-        self.vehicle_name = os.environ['VEHICLE_NAME']
-       
-        # Camera info and image topics
-        self.camera_info_topic = f"/{self.vehicle_name}/camera_node/camera_info"
-        self.distorted_img_topic = f"/{self.vehicle_name}/camera_node/image/compressed"
-       
-        # Bridge for converting between ROS and OpenCV images
-        self.bridge = CvBridge()
-       
-        # Camera parameters (will be updated from camera_info)
-        self.camera_matrix = None
-        self.dist_coeffs = None
-        self.got_camera_info = False
-       
-        # Create publisher for undistorted images
-        self.undistorted_pub = rospy.Publisher(
-            f"/{self.vehicle_name}/camera_node/image/undistorted",
-            Image,
-            queue_size=1
-        )
-       
-        # Subscribe to camera info topic
+            node_name=node_name, node_type=NodeType.VISUALIZATION)
+
+        # Static parameters
+        self._hostname = uname()[1]
+        if not match(r"^csc\d+$", self._hostname):
+            print("Pass in the hostname of the bot ![DUCKIEBOT]:")
+            self._hostname = input()
+
+        self._vehicle_name = self._hostname
+        self._camera_topic = f"/{self._vehicle_name}/camera_node/image/compressed"
+        self._custom_topic = f"/{self._vehicle_name}/undistorted_node/image/compressed"
+
+        self._homo = np.array([
+            [-4.4176150901508024e-05,  0.0004846965281425196,  0.30386285736827856],
+            [-0.0015921548874079563,   1.0986376221035314e-05, 0.4623061006515125],
+            [-0.00029009271219456394,  0.011531091762722323,  -1.4589875279686733]
+        ])
+
+        # Subscribe to camera info
         self.camera_info_sub = rospy.Subscriber(
-            self.camera_info_topic,
-            CameraInfo,
-            self.camera_info_callback
+            f'/{self._vehicle_name}/camera_node/camera_info', CameraInfo, self.camera_info_callback
         )
-       
-        # Subscribe to compressed image topic
-        self.image_sub = rospy.Subscriber(
-            self.distorted_img_topic,
-            CompressedImage,
-            self.image_callback
-        )
-       
-        # Set processing rate to 5 Hz as suggested in the exercise
-        self.rate = rospy.Rate(5)
-       
-        self.log("Camera distortion correction node initialized")
-   
-    def camera_info_callback(self, msg):
-        """Extract camera intrinsic parameters from camera_info topic"""
-        if not self.got_camera_info:
-            # Extract the camera matrix (K) from the message
-            self.camera_matrix = np.array(msg.K).reshape((3, 3))
-           
-            # Extract distortion coefficients (D) from the message
-            self.dist_coeffs = np.array(msg.D)
-           
-            self.got_camera_info = True
-            self.log(f"Received camera intrinsic parameters:")
-            self.log(f"Camera Matrix (K): \n{self.camera_matrix}")
-            self.log(f"Distortion Coefficients (D): {self.dist_coeffs}")
-   
-    def image_callback(self, msg):
-        """Process incoming compressed images, undistort them, and publish the result"""
-        # Skip if we haven't received camera parameters yet
-        if not self.got_camera_info:
+
+        self.D = None  # Storage for distortion coefficients
+        self.K = None  # Storage for intrinsic matrix
+        self.height = None
+        self.width = None
+        self.map1 = None  # Precomputed remap matrices
+        self.map2 = None
+
+        self.scale_factor = 0.5  # Reduce resolution to 50%
+
+        # Bridge between OpenCV and ROS
+        self._bridge = CvBridge()
+
+        # Construct subscriber
+        self.sub = rospy.Subscriber(
+            self._camera_topic, CompressedImage, self.camera_reader_callback, queue_size=5)
+        self.pub = rospy.Publisher(
+            self._custom_topic, CompressedImage, queue_size=5)
+
+        # Construct the scaling matrix
+        S = np.array([
+            [self.scale_factor, 0, 0],
+            [0, self.scale_factor, 0],
+            [0, 0, 1]  # Keep the last row unchanged
+        ])
+
+        # Scale the homography matrix
+        self._homo = S @ self._homo @ np.linalg.inv(S)
+
+        rospy.set_param(
+            f"/{self._vehicle_name}/updated_extrinsics", self._homo.flatten().tolist())
+
+    def camera_reader_callback(self, msg):
+        if rospy.is_shutdown():
             return
-       
-        try:
-            # Convert compressed image to OpenCV format
-            np_arr = np.frombuffer(msg.data, np.uint8)
-            distorted_img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-           
-            # Get image dimensions
-            h, w = distorted_img.shape[:2]
-           
-            # Calculate optimal camera matrix
-            # Alpha parameter (0-1): 0 = all distorted pixels visible, 1 = all pixels visible
-            new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(
-                self.camera_matrix, self.dist_coeffs, (w, h), 0, (w, h)
-            )
-           
-            # Manual undistortion using cv2.undistort
-            undistorted_img = cv2.undistort(
-                distorted_img,
-                self.camera_matrix,
-                self.dist_coeffs,
-                None,
-                new_camera_matrix
-            )
-           
-            # Optional: Crop the image to the ROI
-            x, y, w, h = roi
-            if all([x, y, w, h]):  # Make sure ROI is valid
-                undistorted_img = undistorted_img[y:y+h, x:x+w]
-           
-            # Convert back to ROS format and publish
-            undistorted_msg = self.bridge.cv2_to_imgmsg(undistorted_img, "bgr8")
-            undistorted_msg.header = msg.header  # Keep original timestamp
-            self.undistorted_pub.publish(undistorted_msg)
-           
-        except Exception as e:
-            self.logerr(f"Error processing image: {e}")
-   
-    def run(self):
-        """Main loop to keep the node running at the specified rate"""
-        self.log("Starting camera distortion correction node")
-        while not rospy.is_shutdown():
-            self.rate.sleep()
+
+        image = self._bridge.compressed_imgmsg_to_cv2(msg)
+
+        if self.K is None or self.D is None:
+            rospy.logwarn("Camera parameters not received yet.")
+            return
+
+        # Compute remap matrices once
+        if self.map1 is None or self.map2 is None:
+            self.map1, self.map2 = cv2.initUndistortRectifyMap(
+                self.K, self.D, None, self.K, (self.width, self.height), cv2.CV_16SC2)
+
+        # Apply undistortion using precomputed maps
+        dst = cv2.remap(image, self.map1, self.map2,
+                        interpolation=cv2.INTER_LINEAR)
+
+        # height, _ = dst.shape[:2]
+
+        # # Crop bottom 50% (remove top half)
+        # dst = dst[height // 2:, :]
+
+        # Get image dimensions
+        # height, width = dst.shape[:2]
+
+        # # Create a black bar for the top third
+        # black_bar = np.zeros((height // 3, width, 3), dtype=np.uint8)
+
+        # # Replace the top third with the black bar
+        # dst[:height // 3, :] = black_bar
+
+        # dst = cv2.resize(dst, None, fx=self.scale_factor, fy=self.scale_factor,
+        #                  interpolation=cv2.INTER_AREA)
+
+        # blur = cv2.GaussianBlur(dst, (5, 5), 0)
+
+        # Convert back to compressed image message
+        # image_message = self._bridge.cv2_to_compressed_imgmsg(blur)
+
+        image_message = self._bridge.cv2_to_compressed_imgmsg(dst)
+
+        # Publish the compressed image
+        self.pub.publish(image_message)
+
+    def camera_info_callback(self, msg):
+        """Callback to receive and store distortion coefficients."""
+        self.D = np.array(msg.D)
+        self.K = np.array(msg.K).reshape(3, 3)
+        self.width = msg.width
+        self.height = msg.height
+
+        # Destroy the subscription after receiving the values once
+        self.camera_info_sub.unregister()
+        rospy.loginfo("Camera info subscription closed.")
+
 
 if __name__ == '__main__':
-    # Initialize the node
-    camera_node = CameraDistortionNode(node_name='camera_distortion_node')
-    # Run the node
-    camera_node.run()
+    # Create the node
+    node = CameraDistortionNode(node_name='camera_reader_node')
+    # Keep spinning
+    rospy.spin()

@@ -6,7 +6,7 @@ source /environment.sh
 dt-launchfile-init
 
 # launch the camera distortion node
-rosrun computer_vision pid_controller_node.py
+rosrun computer_vision bot_following_node.py
 
 # wait for app to end
 dt-launchfile-join

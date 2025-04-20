@@ -7,7 +7,7 @@ import rospy
 from cv_bridge import CvBridge
 from duckietown.dtros import DTROS, NodeType
 from sensor_msgs.msg import CompressedImage
-from duckietown_msgs.msg import Twist2DStamped, LEDPattern
+from duckietown_msgs.msg import Twist2DStamped
 from std_msgs.msg import Float32MultiArray, String
 import time
 
@@ -78,21 +78,10 @@ class LaneFollowingNode(DTROS):
             queue_size=1
         )
 
-        # 4. LED pattern publisher
-        self.led_pattern_pub = rospy.Publisher(
-            f"/{self.vehicle_name}/led_emitter_node/led_pattern",
-            LEDPattern,
-            queue_size=1
-        )
-
         # Lane detection parameters
         # HSV thresholds for yellow lane
         self.yellow_lower = np.array([20, 100, 100])
         self.yellow_upper = np.array([35, 255, 255])
-
-        # HSV thresholds for ducks
-        self.duck_lower = np.array([20, 100, 100])
-        self.duck_upper = np.array([35, 255, 255])
 
         # HSV thresholds for white lane
         self.white_lower = np.array([0, 0, 180])
@@ -309,49 +298,21 @@ class LaneFollowingNode(DTROS):
         self.cmd_vel_pub.publish(cmd)
         self.log("Lane following node stopped")
 
-    def set_led_pattern(self, pattern):
-        """Set LED pattern for the robot (left or right signals, or off)"""
-        pattern_msg = LEDPattern()
-        pattern_msg.header.stamp = rospy.Time.now()
-
-        # Pattern definitions
-        if pattern == "off":
-            # All LEDs off
-            colors = [(0, 0, 0)] * 5
-        elif pattern == "left":
-            # Left turn signal (leftmost LEDs in yellow)
-            colors = [(1, 1, 0), (1, 1, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)]
-        elif pattern == "right":
-            # Right turn signal (rightmost LEDs in yellow)
-            colors = [(0, 0, 0), (0, 0, 0), (0, 0, 0), (1, 1, 0), (1, 1, 0)]
-        elif pattern == "brake":
-            # Brake lights (all LEDs in red)
-            colors = [(1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0)]
-        else:
-            # Default: all off
-            colors = [(0, 0, 0)] * 5
-
-        # Set colors for each LED
-        for r, g, b in colors:
-            # Append each color value directly to the rgb_vals array
-            pattern_msg.rgb_vals.append(float(r))  # R
-            pattern_msg.rgb_vals.append(float(g))  # G
-            pattern_msg.rgb_vals.append(float(b))  # B
-            pattern_msg.rgb_vals.append(0.0)       # White (not used)
-            pattern_msg.rgb_vals.append(0.0)       # Nothing (not used)
-
-        self.led_pattern_pub.publish(pattern_msg)
+    def on_shutdown(self):
+        """Clean up when node is shut down"""
+        for i in range(20):
+            cmd = Twist2DStamped()
+            cmd.v = 0
+            cmd.omega = 0
+            self.cmd_vel_pub.publish(cmd)
+        self.log("Lane following node stopped")
+        self.log("Lane following node shutting down, robot stopped")
 
 
 if __name__ == '__main__':
     # Initialize the node
     lane_following_node = LaneFollowingNode(node_name='lane_following_node')
 
-    try:
-        # Spin until interrupted
-        rospy.spin()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        # Make sure to stop the robot when the node is shut down
-        lane_following_node.stop()
+    # Register shutdown hook
+    rospy.on_shutdown(lane_following_node.on_shutdown)
+    rospy.spin()
