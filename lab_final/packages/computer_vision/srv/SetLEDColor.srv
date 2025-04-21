@@ -1,0 +1,8 @@
+# SetLEDColor.srv
+
+# Request: List of 5 strings representing colors for each light
+string[5] colors
+
+---
+# Response: success flag
+bool success
