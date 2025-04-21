@@ -27,11 +27,27 @@ class CombinedControllerNode(DTROS):
         super(CombinedControllerNode, self).__init__(
             node_name=node_name, node_type=NodeType.PERCEPTION)
 
+        # Grid position tracking for intersections
+        self.grid_position = "center"  # Can be "left", "center", or "right"
+        self.grid_position_history = []  # Store recent positions for stability
+        self.position_history_length = 5  # Number of positions to keep in history
+
+        # Add emergency stopping flag
+        self.emergency_stopping = False
+
+        # Add stop timing management
+        self.stopping_duration = 3.0  # Duration to stop at red lines
+        self.stop_start_time = 0
+        self.stop_in_progress = False
+
         # Red intersection setup
         self.stopped_at_red = False
         self.time_of_red_stop = 0
         self.red_cooldown_duration = 10  # Seconds before detecting another red line
         self.red_stops_count = 0  # Counter for red stops
+        self.is_turning_at_intersection = False
+        self.turn_start_time = 0
+        self.turn_duration = 1.5  # Duration for turning at intersection
 
         # Get vehicle name
         self.vehicle_name = os.environ.get('VEHICLE_NAME')
@@ -283,6 +299,49 @@ class CombinedControllerNode(DTROS):
         except rospy.ServiceException as e:
             rospy.logerr(f"Service call failed: {e}")
 
+    def update_grid_position(self, grid_center_x, img_width):
+        """
+        Update the tracked position of the grid in the image
+        Args:
+            grid_center_x: x-coordinate of the grid pattern center
+            img_width: width of the image
+        """
+        # Determine which third of the image the grid is in
+        left_third_end = img_width // 3
+        right_third_start = (img_width * 2) // 3
+
+        # Determine current position
+        if grid_center_x < left_third_end:
+            current_position = "left"
+        elif grid_center_x > right_third_start:
+            current_position = "right"
+        else:
+            current_position = "center"
+
+        # Add to history
+        self.grid_position_history.append(current_position)
+
+        # Keep history at the desired length
+        if len(self.grid_position_history) > self.position_history_length:
+            self.grid_position_history.pop(0)
+
+        # Update the current position based on majority vote in history
+        if len(self.grid_position_history) > 0:
+            left_count = self.grid_position_history.count("left")
+            center_count = self.grid_position_history.count("center")
+            right_count = self.grid_position_history.count("right")
+
+            if left_count > center_count and left_count > right_count:
+                self.grid_position = "left"
+            elif right_count > center_count and right_count > left_count:
+                self.grid_position = "right"
+            else:
+                self.grid_position = "center"
+
+        rospy.loginfo(f"Grid position updated to: {self.grid_position}")
+
+        return self.grid_position
+
     def image_callback(self, msg):
         """Process incoming camera images for both grid detection and lane following"""
         now = rospy.Time.now()
@@ -300,6 +359,17 @@ class CombinedControllerNode(DTROS):
         except Exception as e:
             self.log(f"Error converting image: {e}", 'error')
             return
+
+        # Skip processing if currently executing a turn at an intersection
+        if self.is_turning_at_intersection:
+            current_time = rospy.get_time()
+            if current_time - self.turn_start_time < self.turn_duration:
+                # Still turning, do nothing else in this callback
+                return
+            else:
+                # Turn completed
+                self.is_turning_at_intersection = False
+                rospy.loginfo("Intersection turn completed")
 
         # First, try to detect the circle grid
         detection_result = self.detect_circle_grid(image_cv)
@@ -350,11 +420,15 @@ class CombinedControllerNode(DTROS):
             self.last_seen = now
             self.last_pattern = (error_distance, center_offset)
 
+            # Update the grid position tracking
+            grid_center_x = image_cv.shape[1] // 2 + center_offset
+            self.update_grid_position(grid_center_x, image_cv.shape[1])
+
             # Publish detection status
             self.publish_grid_detection_status(True)
 
             # Publish status
-            status_msg = f"Grid detected: dist_error={error_distance:.2f}, offset={center_offset:.2f}"
+            status_msg = f"Grid detected: dist_error={error_distance:.2f}, offset={center_offset:.2f}, position={self.grid_position}"
             self.pub_status.publish(String(status_msg))
         else:
             self.grid_found_frames_count = 0
@@ -382,39 +456,40 @@ class CombinedControllerNode(DTROS):
                         self.publish_grid_detection_status(True)
 
                         # Publish status
-                        status_msg = f"Using last grid pattern: dist_error={error_distance:.2f}, offset={center_offset:.2f}, missed frames: {self.missed_frames_count}"
+                        status_msg = f"Using last grid pattern: dist_error={error_distance:.2f}, offset={center_offset:.2f}, missed frames: {self.missed_frames_count}, position={self.grid_position}"
                         self.pub_status.publish(String(status_msg))
 
-            # Check for red line detection
-            if self.mode == "lane_following":  # Only check for red lines when in lane-following mode
-                # Check if we're in the cooldown period
-                current_time = rospy.get_time()
-                if (current_time - self.time_of_red_stop) > self.red_cooldown_duration:
-                    # Check for red line
-                    stopline_detected, distance = self.detect_red_intersection(
-                        image_cv)
+        # Check for red line detection
+        if self.mode == "lane_following":  # Only check for red lines when in lane-following mode
+            # Check if we're in the cooldown period
+            current_time = rospy.get_time()
+            if (current_time - self.time_of_red_stop) > self.red_cooldown_duration:
+                # Check for red line
+                stopline_detected, area = self.detect_red_intersection(
+                    image_cv)
 
-                    # Debug visualization if needed
-                    if stopline_detected:
-                        rospy.loginfo(
-                            f"Red line detected, distance: {distance:.2f}")
+                # Debug visualization if needed
+                if stopline_detected:
+                    # Use area as a better proximity measure - stop when area is large enough
+                    stop_area_threshold = 2000  # Adjust based on testing
+                    rospy.loginfo(f"Red line detected, area: {area:.2f}")
 
-                        # Only stop if we're close enough to the line
-                        if distance < 40:  # Threshold distance for stopping
-                            self.stop_at_red()
-                            self.stopped_at_red = False  # Reset for next detection
+                    # Only stop if the area is large enough (meaning we're close enough)
+                    if area > stop_area_threshold:
+                        self.stop_at_red()
+                        self.stopped_at_red = False  # Reset for next detection
 
-                self.publish_grid_detection_status(False)
+                        self.publish_grid_detection_status(False)
 
-                # Process the image for lane following
-                rospy.loginfo("Calling process_lane_following")
-                self.process_lane_following(image_cv)
-                rospy.loginfo("Finished process_lane_following")
+                        # Process the image for lane following
+                        rospy.loginfo("Calling process_lane_following")
+                        self.process_lane_following(image_cv)
+                        rospy.loginfo("Finished process_lane_following")
 
-                if self.stopped_at_red:
-                    # We're in cooldown period but want to show we detected the line
-                    self.pub_status.publish(String(
-                        f"Red line cooldown: {int(self.red_cooldown_duration - (current_time - self.time_of_red_stop))}s remaining"))
+                        if self.stopped_at_red:
+                            # We're in cooldown period but want to show we detected the line
+                            self.pub_status.publish(String(
+                                f"Red line cooldown: {int(self.red_cooldown_duration - (current_time - self.time_of_red_stop))}s remaining"))
 
     # ------------------------------------------------------------------------
     # Circle Grid Following Methods
@@ -433,8 +508,26 @@ class CombinedControllerNode(DTROS):
         # Get image dimensions
         img_height, img_width = image_cv.shape[:2]
 
+        # Calculate the boundaries for thirds
+        left_third_end = img_width // 3
+        right_third_start = (img_width * 2) // 3
+
         # Create debug image of full frame for visualization
         debug_img = image_cv.copy()
+
+        # Draw vertical lines dividing the image into thirds
+        cv2.line(debug_img, (left_third_end, 0),
+                 (left_third_end, img_height), (0, 255, 0), 2)
+        cv2.line(debug_img, (right_third_start, 0),
+                 (right_third_start, img_height), (0, 255, 0), 2)
+
+        # Add labels for the thirds
+        cv2.putText(debug_img, "LEFT", (left_third_end // 2, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(debug_img, "CENTER", ((left_third_end + right_third_start) // 2, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(debug_img, "RIGHT", (right_third_start + (img_width - right_third_start) // 2, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         # Process the full image without cropping
         process_img = image_cv
@@ -471,6 +564,19 @@ class CombinedControllerNode(DTROS):
             # Calculate center offset
             center_offset = float(np.mean(xs) - img_width / 2)
 
+            # Calculate the pattern's center x-coordinate
+            pattern_center_x = float(np.mean(xs))
+
+            # Determine which third the pattern is in
+            pattern_position = "center"
+            if pattern_center_x < left_third_end:
+                pattern_position = "left"
+            elif pattern_center_x > right_third_start:
+                pattern_position = "right"
+
+            # Update our tracking of grid position
+            self.update_grid_position(pattern_center_x, img_width)
+
             # Draw detected pattern on debug image
             cv2.drawChessboardCorners(debug_img, tuple(
                 self.circlepattern_dims), centers, found)
@@ -478,6 +584,11 @@ class CombinedControllerNode(DTROS):
             # Add information text
             info_text = f"Grid: Width: {pattern_width:.1f}px, Offset: {center_offset:.1f}px"
             cv2.putText(debug_img, info_text, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Add position information
+            position_text = f"Position: {self.grid_position} (Current: {pattern_position})"
+            cv2.putText(debug_img, position_text, (10, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             # Publish centers if available
@@ -511,6 +622,10 @@ class CombinedControllerNode(DTROS):
         else:
             # No pattern found
             cv2.putText(debug_img, "No grid pattern detected", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # Add current tracked position
+            cv2.putText(debug_img, f"Last Position: {self.grid_position}", (10, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             # Publish debug image
@@ -649,6 +764,10 @@ class CombinedControllerNode(DTROS):
             cv2.putText(vis_img, "Lane Following Mode", (10, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
+            # Add tracked grid position information
+            cv2.putText(vis_img, f"Grid Position: {self.grid_position}", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
             # Publish visualization
             if self.pub_lane_vis.get_num_connections() > 0:
                 vis_msg = self.bridge.cv2_to_compressed_imgmsg(vis_img)
@@ -782,6 +901,20 @@ class CombinedControllerNode(DTROS):
 
     def control_loop(self, event):
         """Control loop that executes the appropriate controller based on current mode"""
+        if self.emergency_stopping:
+            return
+        # Skip control if currently executing a turn at an intersection
+        if self.is_turning_at_intersection:
+            current_time = rospy.get_time()
+            if current_time - self.turn_start_time < self.turn_duration:
+                # Still turning, execute the turn
+                self.execute_intersection_turn()
+                return
+            else:
+                # Turn completed
+                self.is_turning_at_intersection = False
+                rospy.loginfo("Intersection turn completed")
+
         # Log the current state for debugging
         rospy.loginfo(
             f"Control loop running: mode={self.mode}, pattern_detected={self.pattern_detected}, lane_error={self.lane_error}")
@@ -795,7 +928,7 @@ class CombinedControllerNode(DTROS):
             self.follow_grid_pattern(error_distance, center_offset)
 
             # Publish status for debugging
-            status_msg = f"Grid following: dist_error={error_distance:.2f}, offset={center_offset:.2f}"
+            status_msg = f"Grid following: dist_error={error_distance:.2f}, offset={center_offset:.2f}, position={self.grid_position}"
             self.pub_status.publish(String(status_msg))
 
         elif self.mode == "lane_following":
@@ -806,7 +939,7 @@ class CombinedControllerNode(DTROS):
             # Only send commands if we have valid lane error
             if self.lane_error is not None:
                 self.lane_control_loop()
-                status_msg = f"Lane following - lane_error={self.lane_error:.2f}, speed={self.current_speed:.2f}"
+                status_msg = f"Lane following - lane_error={self.lane_error:.2f}, speed={self.current_speed:.2f}, grid_position={self.grid_position}"
                 self.pub_status.publish(String(status_msg))
             else:
                 # If no lane detected, maintain a slow forward movement
@@ -879,16 +1012,23 @@ class CombinedControllerNode(DTROS):
 
     def detect_red_intersection(self, image):
         """
-        Detect red intersection lines in the image
+        Detect red intersection lines in the image, cropping the top 1/3
         Returns: (detected, distance) where:
             - detected: Boolean indicating if a red line is detected
             - distance: Estimated distance to the line (or infinity if none detected)
         """
+        # Get image dimensions
+        img_height, img_width = image.shape[:2]
+
+        # Crop the bottom 2/3 of the image (remove top 1/3)
+        crop_top = int(img_height * 1/3)
+        cropped_image = image[crop_top:, :]
+
         # Create a copy for visualization
-        vis_img = image.copy()
+        vis_img = cropped_image.copy()
 
         # Convert to HSV for color filtering
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2HSV)
 
         # Define red color range
         red_ranges = {'lower': np.array(
@@ -905,12 +1045,18 @@ class CombinedControllerNode(DTROS):
         detected = False
         distance = float('inf')
 
+        # Minimum area to consider for detection (in pixels)
+        min_area_threshold = 500
+
+        # Area threshold for when to actually stop (larger area = closer)
+        stop_area_threshold = 2000  # Adjust this value based on testing
+
         if contours:
             largest_contour = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(largest_contour)
 
             # Check if contour is large enough to be a line
-            if area > 500:
+            if area > min_area_threshold:
                 x, y, w, h = cv2.boundingRect(largest_contour)
 
                 # Draw rectangle around detected line
@@ -920,20 +1066,20 @@ class CombinedControllerNode(DTROS):
                 cv2.drawContours(
                     vis_img, [largest_contour], -1, (0, 255, 255), 2)
 
-                # Estimate distance based on contour position
-                image_height = image.shape[0]
+                # Use the area as the "distance" measure (inverse relationship)
+                # Larger area = closer to the line
+                distance = area
 
-                # Use bottom of the contour for distance calculation
-                distance_to_bottom = image_height - (y + h)
-                distance_percent = (distance_to_bottom / (image_height * 0.5)
-                                    ) * 100  # Normalize to percentage
-
-                # Add text with distance info
-                cv2.putText(vis_img, f"Red Line: {distance_percent:.1f}%", (10, 30),
+                # Add text with area info
+                cv2.putText(vis_img, f"Red Line Area: {area:.0f}px", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                 # Add area info
-                cv2.putText(vis_img, f"Area: {area:.0f}px", (10, 60),
+                cv2.putText(vis_img, f"Stop Threshold: {stop_area_threshold}px", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                # Add tracked grid position
+                cv2.putText(vis_img, f"Grid Position: {self.grid_position}", (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                 detected = True
@@ -945,7 +1091,20 @@ class CombinedControllerNode(DTROS):
                 # Publish visualization
                 if self.pub_red_line_vis.get_num_connections() > 0:
                     try:
-                        vis_msg = self.bridge.cv2_to_compressed_imgmsg(overlay)
+                        # Create a full-sized visualization image with the original dimensions
+                        full_vis = image.copy()
+                        # Mark the cropping boundary with a horizontal line
+                        cv2.line(full_vis, (0, crop_top),
+                                 (img_width, crop_top), (0, 255, 0), 2)
+                        # Place the processed image in the cropped region
+                        full_vis[crop_top:, :] = overlay
+                        # Add text to indicate cropping
+                        cv2.putText(full_vis, "Cropped region for red line detection",
+                                    (10, crop_top - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6, (0, 255, 0), 2)
+
+                        vis_msg = self.bridge.cv2_to_compressed_imgmsg(
+                            full_vis)
                         self.pub_red_line_vis.publish(vis_msg)
                     except Exception as e:
                         self.log(
@@ -958,7 +1117,20 @@ class CombinedControllerNode(DTROS):
                 # Publish visualization anyway to show what's being seen
                 if self.pub_red_line_vis.get_num_connections() > 0:
                     try:
-                        vis_msg = self.bridge.cv2_to_compressed_imgmsg(vis_img)
+                        # Create a full-sized visualization image
+                        full_vis = image.copy()
+                        # Mark the cropping boundary
+                        cv2.line(full_vis, (0, crop_top),
+                                 (img_width, crop_top), (0, 255, 0), 2)
+                        # Place the processed image in the cropped region
+                        full_vis[crop_top:, :] = vis_img
+                        # Add text
+                        cv2.putText(full_vis, "Cropped region for red line detection",
+                                    (10, crop_top - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6, (0, 255, 0), 2)
+
+                        vis_msg = self.bridge.cv2_to_compressed_imgmsg(
+                            full_vis)
                         self.pub_red_line_vis.publish(vis_msg)
                     except Exception as e:
                         self.log(
@@ -971,24 +1143,44 @@ class CombinedControllerNode(DTROS):
             # Publish visualization anyway
             if self.pub_red_line_vis.get_num_connections() > 0:
                 try:
-                    vis_msg = self.bridge.cv2_to_compressed_imgmsg(vis_img)
+                    # Create a full-sized visualization image
+                    full_vis = image.copy()
+                    # Mark the cropping boundary
+                    cv2.line(full_vis, (0, crop_top),
+                             (img_width, crop_top), (0, 255, 0), 2)
+                    # Place the processed image in the cropped region
+                    full_vis[crop_top:, :] = vis_img
+                    # Add text
+                    cv2.putText(full_vis, "Cropped region for red line detection",
+                                (10, crop_top - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6, (0, 255, 0), 2)
+
+                    vis_msg = self.bridge.cv2_to_compressed_imgmsg(full_vis)
                     self.pub_red_line_vis.publish(vis_msg)
                 except Exception as e:
                     self.log(
                         f"Error publishing red line visualization: {e}", 'error')
 
-        return detected, distance_percent if detected else float('inf')
+        return detected, distance if detected else float('inf')
 
     def stop_at_red(self):
-        """Handle the process of stopping at a red line"""
+        """Handle the process of stopping at a red line and then turn based on grid position"""
         if not self.stopped_at_red:
             rospy.loginfo(
                 f"Stopping at red line (stop #{self.red_stops_count + 1})")
             self.time_of_red_stop = rospy.get_time()
 
-            # Stop the robot for 3 seconds
-            self.stop()
-            rospy.sleep(10.0)
+            # Start emergency stop
+            self.emergency_stopping = True
+            self.stop_in_progress = True
+            self.stop_start_time = rospy.get_time()
+
+            # Stop the robot without allowing other commands to interfere
+            self.emergency_stop()
+
+            # Schedule a callback to execute after stop duration
+            rospy.Timer(rospy.Duration(self.stopping_duration),
+                        self.handle_post_stop_actions, oneshot=True)
 
             self.stopped_at_red = True
             self.red_stops_count += 1
@@ -997,21 +1189,143 @@ class CombinedControllerNode(DTROS):
             status_msg = f"Stopped at red line - stop #{self.red_stops_count}"
             self.pub_status.publish(String(status_msg))
 
+    def execute_intersection_turn(self, direction="straight"):
+        """Execute a turn at an intersection based on the specified direction"""
+        # Ensure we have a valid publisher
+        if self.pub_cmd_vel is None or not hasattr(self.pub_cmd_vel, 'publish'):
+            rospy.logwarn(
+                "Command velocity publisher not valid during turn, recreating...")
+            self.pub_cmd_vel = rospy.Publisher(
+                f"/{self.vehicle_name}/car_cmd_switch_node/cmd",
+                Twist2DStamped,
+                queue_size=1
+            )
+            rospy.sleep(0.1)  # Small delay to let publisher initialize
+
+        cmd = Twist2DStamped()
+        cmd.header.stamp = rospy.Time.now()
+        self.change_led_color(['off', 'blue', 'off', 'off', 'blue'])
+
+        if direction == "left":
+            cmd.v = 0.2  # Slow forward speed during turn
+            cmd.omega = 3.0  # Strong left turn
+
+        elif direction == "right":
+            cmd.v = 0.2  # Slow forward speed during turn
+            cmd.omega = -3.0  # Strong right turn
+
+        else:  # straight
+            cmd.v = 0.2  # Medium forward speed
+            cmd.omega = 0.0  # No turning
+
+        try:
+            self.pub_cmd_vel.publish(cmd)
+            rospy.loginfo(
+                f"Executing {direction} turn at intersection: v={cmd.v}, omega={cmd.omega}")
+        except Exception as e:
+            rospy.logerr(f"Error publishing turn command: {e}")
+            # If publishing fails, try to recreate the publisher
+            self.pub_cmd_vel = rospy.Publisher(
+                f"/{self.vehicle_name}/car_cmd_switch_node/cmd",
+                Twist2DStamped,
+                queue_size=1
+            )
+            rospy.sleep(0.2)  # Give it a bit more time to initialize
+            try:
+                self.pub_cmd_vel.publish(cmd)
+                rospy.loginfo(
+                    f"Retry: Executing {direction} turn at intersection")
+            except Exception as e2:
+                rospy.logerr(
+                    f"Second attempt to publish turn command failed: {e2}")
+
+    def handle_post_stop_actions(self, event):
+        """Actions to perform after stopping duration is complete"""
+        if not self.stop_in_progress:
+            return
+
+        # Reset stopping flags
+        self.stop_in_progress = False
+        self.emergency_stopping = False
+
+        # Make sure we have a valid publisher
+        if self.pub_cmd_vel is None or not hasattr(self.pub_cmd_vel, 'publish'):
+            rospy.logwarn(
+                "Command velocity publisher not valid, recreating...")
+            self.pub_cmd_vel = rospy.Publisher(
+                f"/{self.vehicle_name}/car_cmd_switch_node/cmd",
+                Twist2DStamped,
+                queue_size=1
+            )
+            rospy.sleep(0.1)  # Small delay to let publisher initialize
+
+        # Decide which way to turn based on grid position
+        self.is_turning_at_intersection = True
+        self.turn_start_time = rospy.get_time()
+
+        turn_direction = "straight"
+        if self.grid_position == "left":
+            turn_direction = "left"
+            rospy.loginfo("Grid was on LEFT - turning LEFT at intersection")
+        elif self.grid_position == "right":
+            turn_direction = "right"
+            rospy.loginfo("Grid was on RIGHT - turning RIGHT at intersection")
+        else:
+            rospy.loginfo(
+                "Grid was in CENTER - going STRAIGHT at intersection")
+
+        # Execute the turn
+        self.execute_intersection_turn(turn_direction)
+
     def stop(self):
-        """Stop the robot by publishing zero velocity"""
+        self.emergency_stop()
+
+    def emergency_stop(self):
+        """Emergency stop that prevents other commands from being processed"""
+        # Create a new stop command
         cmd = Twist2DStamped()
         cmd.header.stamp = rospy.Time.now()
         cmd.v = 0
         cmd.omega = 0
-        self.pub_cmd_vel.publish(cmd)
-        rospy.loginfo("STOP command issued")
+
+        # Store the original publisher
+        original_publisher = self.pub_cmd_vel
+
+        try:
+            # Send multiple stop commands with the current publisher
+            for i in range(5):
+                self.pub_cmd_vel.publish(cmd)
+                rospy.sleep(0.05)  # Small delay between stop commands
+
+            # Only unregister if we're planning to create a new one
+            if original_publisher:
+                original_publisher.unregister()
+                rospy.sleep(0.1)  # Brief pause to allow unregistration
+
+                # Create a new publisher with same topic
+                self.pub_cmd_vel = rospy.Publisher(
+                    f"/{self.vehicle_name}/car_cmd_switch_node/cmd",
+                    Twist2DStamped,
+                    queue_size=1
+                )
+                rospy.sleep(0.1)  # Wait for publisher to initialize
+
+                # Send one more stop command with the new publisher
+                self.pub_cmd_vel.publish(cmd)
+        except Exception as e:
+            rospy.logerr(f"Error in emergency stop: {e}")
+            # If there was an error, try to restore the original publisher
+            if original_publisher and original_publisher != self.pub_cmd_vel:
+                self.pub_cmd_vel = original_publisher
+
+        rospy.loginfo(
+            "EMERGENCY STOP command issued - vehicle should now be stopped")
 
     def on_shutdown(self):
         """Clean up when node is shut down"""
-        # Stop the robot
-        for i in range(20):  # Send multiple stop commands to ensure it's received
-            self.stop()
-            rospy.sleep(0.05)  # Small delay between stop commands
+        # Use emergency stop to ensure robot really stops
+        self.emergency_stopping = True
+        self.emergency_stop()
         self.log("Combined Controller Node shutting down")
 
 
