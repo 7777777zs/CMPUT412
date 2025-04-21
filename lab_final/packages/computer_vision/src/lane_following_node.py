@@ -46,6 +46,10 @@ class LaneFollowingNode(DTROS):
         self.turn_speed = 0.3        # Speed during sharp turns
         self.current_speed = self.normal_speed
 
+        # Image division parameters
+        self.left_third_end = None   # Will be initialized when we get the first image
+        self.right_third_start = None  # Will be initialized when we get the first image
+
         # Subscribe to camera image
         self.camera_topic = f"/{self.vehicle_name}/camera_node/image/compressed"
         self.camera_sub = rospy.Subscriber(
@@ -104,10 +108,10 @@ class LaneFollowingNode(DTROS):
         # Timer for controller update (10Hz)
         self.timer = rospy.Timer(rospy.Duration(0.1), self.control_loop)
 
-        self.log("Lane following node initialized with PID control")
+        self.log("Lane following node initialized with image thirds split")
 
     def camera_callback(self, msg):
-        """Process the camera image to detect lanes"""
+        """Process the camera image to detect lanes and divide into thirds"""
         try:
             # Convert compressed image to CV image
             img = self.bridge.compressed_imgmsg_to_cv2(msg)
@@ -115,6 +119,15 @@ class LaneFollowingNode(DTROS):
             # Crop to region of interest (lower part of the image)
             roi = img[self.roi_top:self.roi_top +
                       self.roi_height, 0:self.roi_width]
+
+            # Calculate thirds if not already done
+            if self.left_third_end is None:
+                self.img_width = roi.shape[1]
+                self.third_width = self.img_width // 3
+                self.left_third_end = self.third_width
+                self.right_third_start = self.third_width * 2
+                self.log(
+                    f"Image thirds: Left end={self.left_third_end}, Right start={self.right_third_start}")
 
             # Make a copy for visualization
             vis_img = roi.copy()
@@ -124,6 +137,27 @@ class LaneFollowingNode(DTROS):
                 roi, 'yellow')
             white_mask, white_center, white_contour = self.detect_lane(
                 roi, 'white')
+
+            # Draw the vertical lines separating the thirds
+            cv2.line(vis_img, (self.left_third_end, 0),
+                     (self.left_third_end, roi.shape[0]), (0, 0, 255), 1)
+            cv2.line(vis_img, (self.right_third_start, 0),
+                     (self.right_third_start, roi.shape[0]), (0, 0, 255), 1)
+
+            # Apply the filtering logic based on image thirds
+            # Only consider yellow line if it's in the left 2/3 of the image
+            if yellow_center is not None and yellow_center > self.right_third_start:
+                self.log(
+                    "Yellow line detected in wrong position (right third), ignoring")
+                yellow_center = None
+                yellow_contour = None
+
+            # Only consider white line if it's in the right 2/3 of the image
+            if white_center is not None and white_center < self.left_third_end:
+                self.log(
+                    "White line detected in wrong position (left third), ignoring")
+                white_center = None
+                white_contour = None
 
             # Visualize lane detection
             if yellow_contour is not None:
@@ -212,8 +246,17 @@ class LaneFollowingNode(DTROS):
                 cv2.line(img, (center_x, h//2),
                          (error_pos, h//2), (0, 255, 0), 2)
 
+        # Label the thirds
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(img, "L", (self.third_width // 2, 20),
+                    font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, "M", (self.third_width + self.third_width //
+                    2, 20), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, "R", (2 * self.third_width + self.third_width //
+                    2, 20), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
     def calculate_error(self, yellow_center, white_center, img_width):
-        """Calculate the error for lane following based on detected lanes"""
+        """Calculate the error for lane following based on detected lanes with position validation"""
         # Center of the image
         img_center = img_width // 2
 
@@ -230,19 +273,30 @@ class LaneFollowingNode(DTROS):
             else:
                 self.current_speed = self.normal_speed  # Regular speed
 
+            self.status_pub.publish(
+                f"Following both lines - center: {lane_center}, error: {self.error}")
+
         elif yellow_center is not None:
-            # Only yellow lane detected - stay a fixed distance to the right
+            # Only yellow lane detected (on left side) - stay a fixed distance to the right
             # Offset by approx lane width/2
             self.error = yellow_center - (img_center - 100)
             self.current_speed = self.turn_speed  # Slow down when only one lane is visible
+            self.status_pub.publish(
+                f"Following yellow line - center: {yellow_center}, error: {self.error}")
 
         elif white_center is not None:
-            # Only white lane detected - stay a fixed distance to the left
+            # Only white lane detected (on right side) - stay a fixed distance to the left
             # Offset by approx lane width/2
             self.error = white_center - (img_center + 100)
             self.current_speed = self.turn_speed  # Slow down when only one lane is visible
+            self.status_pub.publish(
+                f"Following white line - center: {white_center}, error: {self.error}")
 
-        # If no lanes detected, keep the previous error (no update)
+        else:
+            # No valid lane lines detected
+            self.status_pub.publish(
+                "No lines detected - maintaining previous error")
+            # If no lanes detected, keep the previous error (no update)
 
     def control_loop(self, event):
         """PID control loop for lane following"""
@@ -290,6 +344,14 @@ class LaneFollowingNode(DTROS):
                       f"I: {self.integral:.2f}, Omega: {omega:.2f}, Speed: {self.current_speed:.2f}")
         self.status_pub.publish(status_msg)
 
+    def get_thirds(self):
+        """Return the boundaries of the image thirds"""
+        return {
+            'left_third_end': self.left_third_end,
+            'middle_third_end': self.right_third_start,
+            'right_third_start': self.right_third_start
+        }
+
     def stop(self):
         """Stop the robot by publishing zero velocity"""
         cmd = Twist2DStamped()
@@ -300,7 +362,7 @@ class LaneFollowingNode(DTROS):
 
     def on_shutdown(self):
         """Clean up when node is shut down"""
-        for i in range(20):
+        for i in range(100):
             cmd = Twist2DStamped()
             cmd.v = 0
             cmd.omega = 0
